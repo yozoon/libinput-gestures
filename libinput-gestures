@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 'Read gestures from libinput touchpad and action shell commands.'
 # Mark Blakeney, Sep 2015
-import os, sys, argparse, subprocess, shlex, re, getpass, fcntl, platform, math
+import os, sys, argparse, evdev, subprocess, time, shlex, re, getpass, fcntl, platform, math, select
+#from macro import *
 from collections import OrderedDict
 from pathlib import Path
 from distutils.version import LooseVersion as Version
@@ -147,6 +148,59 @@ def get_device(name):
     # Give up
     return None
 
+special_keycodes = [
+    evdev.ecodes.KEY_LEFTCTRL, 
+    evdev.ecodes.KEY_LEFTMETA, 
+    evdev.ecodes.KEY_LEFTSHIFT, 
+    evdev.ecodes.KEY_LEFTALT, 
+    evdev.ecodes.KEY_LEFT, 
+    evdev.ecodes.KEY_RIGHT, 
+    evdev.ecodes.KEY_UP, 
+    evdev.ecodes.KEY_DOWN
+]
+
+character_whitelist = '1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+
+def send_hotkey(special_keys, letter=''):
+    with evdev.UInput() as ui:
+        if len(letter) > 1:
+            return False
+
+        if letter == '':
+            writekey = False 
+        elif letter == '+':
+            key = 78 #evdev.ecodes.ecodes['KEY_KPPLUS']
+            writekey = True
+        elif letter == '-':
+            key = 74 #evdev.ecodes.ecodes['KEY_KPMINUS')]
+            writekey = True
+        elif letter.upper() in character_whitelist:
+            key = evdev.ecodes.ecodes['KEY_'+letter.upper()]
+            writekey = True
+        else:
+            return False
+        
+        for i in range(8):
+            if (1 << i) & special_keys == (1 << i):
+                ui.write(evdev.ecodes.EV_KEY, special_keycodes[i], 1)
+        
+        if writekey:
+            ui.write(evdev.ecodes.EV_KEY, key, 1)
+            ui.write(evdev.ecodes.EV_KEY, key, 0)
+            print("key written")
+        ui.syn()
+
+        # Hack to get upper case characters to work
+        time.sleep(0.01)
+
+        for i in range(8):
+            if (1 << i) & special_keys == (1 << i):
+                ui.write(evdev.ecodes.EV_KEY, special_keycodes[i], 0)
+        
+        ui.syn()
+        return True
+
+
 class COMMAND:
     'Generic command handler'
     def __init__(self, args):
@@ -166,6 +220,60 @@ internal_commands = OrderedDict()
 def add_internal_command(cls):
     'Add configuration command to command lookup table based on name'
     internal_commands[re.sub('^COMMAND', '', cls.__name__)] = cls
+
+@add_internal_command
+class COMMAND_input(COMMAND):
+    def __init__(self, args):
+        super().__init__(args)
+        # Set up command line arguments
+        opt = argparse.ArgumentParser(prog=self.argslist[0],
+                description=self.__doc__)
+        opt.add_argument('--ctrl', action='store_true',
+                help='Emulate Ctrl key')
+        opt.add_argument('--super', action='store_true',
+                help='Emulate Super key')
+        opt.add_argument('--shift', action='store_true',
+                help='Emulate Shift key')
+        opt.add_argument('--alt', action='store_true',
+                help='Emulate Alt key')
+        opt.add_argument('--left', action='store_true',
+                help='Emulate Left key')
+        opt.add_argument('--right', action='store_true',
+                help='Emulate Right key')
+        opt.add_argument('--up', action='store_true',
+                help='Emulate Up key')
+        opt.add_argument('--down', action='store_true',
+                help='Emulate Down key')
+        opt.add_argument('text', type=str, nargs='?', default='',
+                help='Input character/text')
+        self.args = opt.parse_args(self.argslist[1:])
+
+    def run(self):
+        sargs = self.args
+        special_key = 0b00000000
+        if sargs.ctrl:
+            special_key = special_key | 1
+        if sargs.super:
+            special_key = special_key | (1 << 1)
+        if sargs.shift:
+            special_key = special_key | (1 << 2)
+        if sargs.alt:
+            special_key = special_key | (1 << 3)
+        if sargs.left:
+            special_key = special_key | (1 << 4)
+        if sargs.right:
+            special_key = special_key | (1 << 5)
+        if sargs.up:
+            special_key = special_key | (1 << 6)
+        if sargs.down:
+            special_key = special_key | (1 << 7)
+
+        result = send_hotkey(special_key, sargs.text)
+        if args.verbose:
+            if result:
+                print('{}: _input: {}'.format(PROG, vars(sargs)))
+            else:
+                print('{}: _input ERROR parsing arguments: {}'.format(PROG, vars(sargs)))
 
 @add_internal_command
 class COMMAND_internal(COMMAND):
@@ -342,6 +450,19 @@ class PINCH(GESTURE):
         elif ratio != 0.0:
             self.action('in' if ratio <= 0.0 else 'out')
 
+@add_gesture_handler
+class TAP(GESTURE):
+    'Class to handle this type of gesture'
+    SUPPORTED_MOTIONS = ('single')
+    extended_text = '_'
+
+    def update(self, coords):
+        pass
+
+    def end(self):
+        self.action('single')
+
+
 # Table of configuration commands
 conf_commands = OrderedDict()
 
@@ -490,48 +611,122 @@ if not proglock:
 # Note your must "sudo gpasswd -a $USER input" then log out/in for
 # permission to access the device.
 devstr = ' --device {}'.format(device.get('kernel')) if device else ''
-command = 'stdbuf -oL -- {}{}'.format(cmd_debug_events, devstr)
+command1 = 'stdbuf -oL -- {}{}'.format(cmd_debug_events, devstr)
+command2 = 'stdbuf -oL -- evtest {}'.format(device.get('kernel'))
 
-cmd = subprocess.Popen(shlex.split(command), stdout=subprocess.PIPE,
+cmd1 = subprocess.Popen(shlex.split(command1), stdout=subprocess.PIPE,
         bufsize=1, universal_newlines=True)
+cmd2 = subprocess.Popen(shlex.split(command2), stdout=subprocess.PIPE,
+        bufsize=0, universal_newlines=True)
+
+pl1 = select.poll()
+pl2 = select.poll()
+pl1.register(cmd1.stdout, select.POLLIN)
+pl2.register(cmd2.stdout, select.POLLIN)
+
+TAP_DELAY = 0.1
+TAP_TIMEOUT = 0.9
+GESTURE_TIMEOUT = 1.0
+
+maxtap = 0
+prev_maxtap = 2 # Only 3, 4 and 5 finger taps are supported
+
+gesturetrig = 0
+taptrig = 0
+
+gesture_active = False
+tap_triggered = False
+tap_active = False
+
+handler = None
 
 # Sit in a loop forever reading the libinput messages ..
-handler = None
-for line in cmd.stdout:
+while True:
+    now = time.time()
 
-    # Just output raw messages if in that mode
-    if args.raw:
-        print(line.strip())
-        continue
+    # Check libinput events
+    if pl1.poll(1):
+        line = cmd1.stdout.readline()
+        # Just output raw messages if in that mode
+        if args.raw:
+            print(line.strip())
+            continue
 
-    # Only interested in gestures
-    if 'GESTURE_' not in line:
-        continue
+        # Only interested in gestures
+        if 'GESTURE_' in line:
+            gesture_active = True
 
-    # Split received message line into relevant fields
-    dev, gevent, time, other = line.strip().split(maxsplit=3)
-    gesture, event = gevent[8:].split('_')
-    fingers, *argslist = other.split(maxsplit=1)
-    params = argslist[0] if argslist else ''
+            gesturetrig = time.time()
 
-    # Action each type of event
-    if event == 'UPDATE':
+            # Split received message line into relevant fields
+            dev, gevent, tm, other = line.strip().split(maxsplit=3)
+            gesture, event = gevent[8:].split('_')
+            fingers, *argslist = other.split(maxsplit=1)
+            params = argslist[0] if argslist else ''
+
+            # Action each type of event
+            if event == 'UPDATE':
+                if handler:
+                    # Split parameters into list of clean numbers
+                    handler.update(re.split(r'[^-.\d]+', params))
+            elif event == 'BEGIN':
+                handler = handlers.get(gesture)
+                if handler:
+                    handler.begin(fingers)
+                else:
+                    print('Unknown gesture received: {}.'.format(gesture),
+                            file=sys.stderr)
+            elif event == 'END':
+                # Ignore gesture if final action is cancelled
+                if handler:
+                    if params != 'cancelled':
+                        handler.end()
+                    handler = None
+            else:
+                print('Unknown gesture + event received: {} + {}.'.format(gesture,
+                    event), file=sys.stderr)
+
+    # Check evtest events
+    if pl2.poll(1):
+        line2 = cmd2.stdout.readline()
+        if 'EV_KEY' in line2 and not gesture_active:
+            # To only register taps when one of the following three events occurs:
+            listed_tap = False 
+            if 'BTN_TOOL_TRIPLETAP' in line2 and maxtap < 3:
+                maxtap = 3
+                listed_tap = True
+            elif 'BTN_TOOL_QUADTAP' in line2 and maxtap < 4:
+                maxtap = 4
+                listed_tap = True
+            elif 'BTN_TOOL_QUINTTAP' in line2 and maxtap < 5:
+                maxtap = 5
+                listed_tap = True
+
+            if maxtap > prev_maxtap and not tap_active and listed_tap:
+                taptrig = time.time()
+                tap_triggered = True
+                tap_fingers = str(maxtap)
+                prev_maxtap = maxtap
+                maxtap = 0
+        elif gesture_active:
+            tap_triggered = False
+
+    if now - gesturetrig > GESTURE_TIMEOUT and gesture_active:
+        maxtap = 0
+        prev_maxtap = 2
+        gesture_active = False
+        
+    if now - taptrig > TAP_TIMEOUT and tap_active:
+        maxtap = 0
+        prev_maxtap = 2
+        tap_active = False
+
+    if now - taptrig > TAP_DELAY and tap_triggered and not gesture_active:
+        tap_active = True
+        tap_triggered = False
+        maxtap = 0
+        handler = handlers.get('TAP')
         if handler:
-            # Split parameters into list of clean numbers
-            handler.update(re.split(r'[^-.\d]+', params))
-    elif event == 'BEGIN':
-        handler = handlers.get(gesture)
-        if handler:
-            handler.begin(fingers)
-        else:
-            print('Unknown gesture received: {}.'.format(gesture),
-                    file=sys.stderr)
-    elif event == 'END':
-        # Ignore gesture if final action is cancelled
-        if handler:
-            if params != 'cancelled':
-                handler.end()
-            handler = None
-    else:
-        print('Unknown gesture + event received: {} + {}.'.format(gesture,
-            event), file=sys.stderr)
+            handler.begin(tap_fingers)
+            handler.end()
+        
